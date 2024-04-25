@@ -3,6 +3,7 @@ use clap::Parser;
 mod commands;
 mod error;
 mod keystore;
+mod util;
 use anyhow::Result;
 use commands::{
     claim_command, insert_key_command, youdle_staking_distribution_command, Args, Commands,
@@ -24,7 +25,7 @@ async fn main() -> Result<()> {
         Commands::InsertKey { name, key } => insert_key_command(name, key)?,
         Commands::Youdles(youdles_command) => match youdles_command {
             YoudlesCommands::DistributeRewards { account, csv } => {
-                youdle_staking_distribution_command(account, csv, extra).await
+                youdle_staking_distribution_command(account, csv, extra).await?
             }
         },
         Commands::Staking(staking_command) => match staking_command {

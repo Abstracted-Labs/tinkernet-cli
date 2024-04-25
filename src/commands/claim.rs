@@ -1,6 +1,6 @@
 use crate::{
-    commands::{consts::TINKERNET_WEBSOCKET, get_key_interactive, ExtraArgs},
-    error::ClaimError,
+    commands::{consts::TINKERNET_WEBSOCKET, get_signer_interactive, ExtraArgs},
+    error::{ApiError, ClaimError, CliError},
     keystore::Keystore,
     tinkernet::{
         self,
@@ -9,13 +9,10 @@ use crate::{
             tinkernet_runtime::RuntimeCall,
         },
     },
+    util::planck_to_unit,
 };
 use inquire::Confirm;
-use subxt::{
-    ext::sp_core::{sr25519::Pair, Pair as PairTrait},
-    tx::PairSigner,
-    OnlineClient, PolkadotConfig,
-};
+use subxt::{OnlineClient, PolkadotConfig};
 
 pub enum EraRange {
     All,
@@ -33,27 +30,23 @@ pub async fn claim_command(
     start: Option<u32>,
     end: Option<u32>,
     extra: ExtraArgs,
-) -> Result<(), ClaimError> {
+) -> Result<(), CliError> {
     let keystore = Keystore::open();
-    let key = get_key_interactive(&keystore, account).unwrap();
+    let signer = get_signer_interactive(&keystore, account)?;
 
     let api = OnlineClient::<PolkadotConfig>::from_url(
         extra.endpoint.unwrap_or(TINKERNET_WEBSOCKET.to_string()),
     )
     .await
-    .unwrap();
+    .map_err(|_| ApiError::EndpointConnectionFailed)?;
 
     let era_range = match (all, start, end) {
         (true, None, None) => EraRange::All,
         (false, Some(start_era), None) => EraRange::EraToEnd(start_era),
         (false, None, Some(end_era)) => EraRange::StartToEra(end_era),
         (false, Some(start_era), Some(end_era)) => EraRange::EraToEra(start_era, end_era),
-        _ => return Err(ClaimError::Unknown),
+        _ => return Err(CliError::Unknown),
     };
-
-    let keypair = Pair::from_string(key.as_str(), None).unwrap();
-
-    let signer = PairSigner::<PolkadotConfig, _>::new(keypair);
 
     let (min, max) = if let Some(core_id) = core {
         match era_range {
@@ -65,10 +58,10 @@ pub async fn claim_command(
                     .storage()
                     .at_latest()
                     .await
-                    .unwrap()
+                    .map_err(|_| ApiError::StorageFailed)?
                     .iter(core_storage_query)
                     .await
-                    .unwrap();
+                    .map_err(|_| ApiError::StorageFailed)?;
 
                 let (mut min, mut max) = (0, 0);
 
@@ -76,16 +69,16 @@ pub async fn claim_command(
                     if !kv
                         .value
                         .as_type::<CoreStakeInfo<u128>>()
-                        .unwrap()
+                        .map_err(|_| ApiError::DecodeFailed)?
                         .reward_claimed
                     {
-                        let era = kv.keys[1].as_u128().unwrap() as u32;
-
-                        if era < min || min == 0 {
-                            min = era
-                        }
-                        if era > max {
-                            max = era
+                        if let Some(era) = kv.keys[1].as_u128().map(|k| k as u32) {
+                            if era < min || min == 0 {
+                                min = era
+                            }
+                            if era > max {
+                                max = era
+                            }
                         }
                     }
                 }
@@ -115,9 +108,9 @@ pub async fn claim_command(
                 .tx()
                 .create_signed(&proposal_tx, &signer, Default::default())
                 .await
-                .unwrap();
+                .map_err(|_| ApiError::SigningFailed)?;
 
-            let fee = tx.partial_fee_estimate().await.unwrap();
+            let maybe_fee = tx.partial_fee_estimate().await;
 
             Confirm::new(
                 format!(
@@ -129,11 +122,15 @@ pub async fn claim_command(
             )
             .with_default(false)
             .with_help_message(
-                format!(
-                    "This transaction will cost approximately {} TNKR in fees",
-                    (fee as f64 / 1000000000000.0_f64),
-                )
-                .as_str(),
+                maybe_fee
+                    .map(|fee| {
+                        format!(
+                            "This transaction will cost approximately {} TNKR in fees.",
+                            planck_to_unit(fee)
+                        )
+                    })
+                    .unwrap_or(String::from("Could not calculate transaction fees."))
+                    .as_str(),
             )
             .prompt()
             .map_err(|_| ClaimError::Rejected)?;
@@ -141,17 +138,20 @@ pub async fn claim_command(
             let events = tx
                 .submit_and_watch()
                 .await
-                .unwrap()
+                .map_err(|_| ApiError::SubmissionFailed)?
                 .wait_for_finalized_success()
                 .await
-                .unwrap();
+                .map_err(ApiError::TransactionNotSuccessful)?;
 
             let total_claimed: u128 = events
                 .find::<tinkernet::ocif_staking::events::CoreClaimed>()
-                .filter_map(|event| {
-                    let event = event.unwrap();
-                    if event.core == core_id {
-                        Some(event.amount)
+                .filter_map(|maybe_event| {
+                    if let Ok(event) = maybe_event {
+                        if event.core == core_id {
+                            Some(event.amount)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -160,7 +160,7 @@ pub async fn claim_command(
 
             eprintln!(
                 "Successfully claimed {} TNKR for core #{}",
-                (total_claimed as f64 / 1000000000000.0_f64),
+                planck_to_unit(total_claimed),
                 core_id
             );
         }
@@ -169,7 +169,7 @@ pub async fn claim_command(
 
         (None, false, true) => unimplemented!(),
 
-        _ => return Err(ClaimError::Unknown),
+        _ => return Err(CliError::Unknown),
     }
 
     Ok(())

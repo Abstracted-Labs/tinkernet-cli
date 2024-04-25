@@ -1,8 +1,9 @@
 use crate::{
     commands::{
         consts::{youdle_consts::*, TINKERNET_WEBSOCKET},
-        get_key_interactive, ExtraArgs,
+        get_signer_interactive, ExtraArgs,
     },
+    error::{ApiError, CliError, YoudleDistError},
     keystore::Keystore,
     tinkernet::{
         self,
@@ -21,11 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use subxt::{
     dynamic::Value,
-    ext::sp_core::{
-        crypto::{AccountId32, Pair as PairTrait, Ss58Codec},
-        sr25519::Pair,
-    },
-    tx::PairSigner,
+    ext::sp_core::crypto::{AccountId32, Ss58Codec},
     OnlineClient, PolkadotConfig,
 };
 
@@ -151,9 +148,9 @@ pub async fn youdle_staking_distribution_command(
     account: Option<String>,
     csv: Option<Option<String>>,
     extra: ExtraArgs,
-) {
+) -> Result<(), CliError> {
     let keystore = Keystore::open();
-    let key = get_key_interactive(&keystore, account).unwrap();
+    let signer = get_signer_interactive(&keystore, account)?;
 
     let unclaimed_res: GQLResponse<UnclaimedCoreGQLData> = surf::post(TINKERNET_OCIF_SQUID)
         .body_json(&UNCLAIMED_CORE_QUERY)
@@ -177,7 +174,7 @@ pub async fn youdle_staking_distribution_command(
         extra.endpoint.unwrap_or(TINKERNET_WEBSOCKET.to_string()),
     )
     .await
-    .unwrap();
+    .map_err(|_| ApiError::EndpointConnectionFailed)?;
 
     let keys: Vec<Value> = vec![YOUDLE_DAO_ID.into()];
     let core_storage_query = subxt::dynamic::storage("OcifStaking", "CoreEraStake", keys);
@@ -186,10 +183,10 @@ pub async fn youdle_staking_distribution_command(
         .storage()
         .at_latest()
         .await
-        .unwrap()
+        .map_err(|_| ApiError::StorageFailed)?
         .iter(core_storage_query)
         .await
-        .unwrap();
+        .map_err(|_| ApiError::StorageFailed)?;
 
     let (mut min, mut max) = (0, 0);
 
@@ -197,16 +194,16 @@ pub async fn youdle_staking_distribution_command(
         if !kv
             .value
             .as_type::<CoreStakeInfo<u128>>()
-            .unwrap()
+            .map_err(|_| ApiError::DecodeFailed)?
             .reward_claimed
         {
-            let era = kv.keys[1].as_u128().unwrap() as u32;
-
-            if era < min || min == 0 {
-                min = era
-            }
-            if era > max {
-                max = era
+            if let Some(era) = kv.keys[1].as_u128().map(|k| k as u32) {
+                if era < min || min == 0 {
+                    min = era
+                }
+                if era > max {
+                    max = era
+                }
             }
         }
     }
@@ -234,7 +231,7 @@ pub async fn youdle_staking_distribution_command(
         vec![
             YOUDLE_DAO_ID.into(),
             AccountId32::from_string(YOUDLE_DAO_ADDRESS)
-                .unwrap()
+                .expect("never fails")
                 .encode()
                 .into(),
         ],
@@ -250,7 +247,7 @@ pub async fn youdle_staking_distribution_command(
         .unwrap()
         .unwrap()
         .as_type::<GeneralStakerInfo>()
-        .unwrap();
+        .map_err(|_| ApiError::DecodeFailed)?;
 
     let min: u32 = results
         .stakes
@@ -461,18 +458,16 @@ pub async fn youdle_staking_distribution_command(
     let mut send_rewards_calls = {
         let mut calls: Vec<RuntimeCall> = Vec::new();
 
-        distribution
-            .clone()
-            .into_iter()
-            .for_each(|(address, value)| {
-                calls.push(RuntimeCall::Balances(BalancesCall::transfer {
-                    dest: subxt::ext::sp_runtime::MultiAddress::Id(
-                        AccountId32::from_string(&address).unwrap(),
-                    )
-                    .into(),
-                    value,
-                }))
-            });
+        for (address, value) in distribution.clone() {
+            calls.push(RuntimeCall::Balances(BalancesCall::transfer {
+                dest: subxt::ext::sp_runtime::MultiAddress::Id(
+                    AccountId32::from_string(&address)
+                        .map_err(|_| YoudleDistError::FailedDecodingAccount)?,
+                )
+                .into(),
+                value,
+            }));
+        }
 
         calls
     };
@@ -506,10 +501,6 @@ pub async fn youdle_staking_distribution_command(
         };
     }
 
-    let keypair = Pair::from_string(key.as_str(), None).unwrap();
-
-    let signer = PairSigner::<PolkadotConfig, _>::new(keypair);
-
     let proposal_tx = tinkernet::tx().inv4().operate_multisig(
         YOUDLE_DAO_ID,
         None,
@@ -521,21 +512,22 @@ pub async fn youdle_staking_distribution_command(
         .tx()
         .sign_and_submit_then_watch_default(&proposal_tx, &signer)
         .await
-        .unwrap()
+        .map_err(|_| ApiError::SubmissionFailed)?
         .wait_for_finalized_success()
         .await
-        .unwrap();
+        .map_err(ApiError::TransactionNotSuccessful)?;
 
     let event = events
         .find_first::<tinkernet::inv4::events::MultisigVoteStarted>()
-        .unwrap();
+        .map_err(|_| ApiError::EventNotFound)?
+        .ok_or(ApiError::EventNotFound)?;
 
-    if let Some(event) = event {
-        println!(
-            "YoudleDAO distribution proposal created with hash: {}",
-            hex::encode(event.call_hash.as_bytes())
-        );
-    }
+    println!(
+        "YoudleDAO distribution proposal created with hash: {}",
+        hex::encode(event.call_hash.as_bytes())
+    );
+
+    Ok(())
 }
 
 fn write_csv<W: std::io::Write>(

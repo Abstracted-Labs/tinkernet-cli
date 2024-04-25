@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
 use inquire::Select;
-use subxt::ext::sp_core::crypto::SecretString;
+use subxt::{
+    ext::sp_core::{crypto::SecretString, sr25519::Pair, Pair as PairTrait},
+    tx::PairSigner,
+    PolkadotConfig,
+};
 
 pub mod claim;
 pub mod consts;
@@ -11,7 +15,10 @@ pub use claim::claim_command;
 pub use insert_key::insert_key_command;
 pub use youdle_staking_distribution::youdle_staking_distribution_command;
 
-use crate::{error::CliError, keystore::Keystore};
+use crate::{
+    error::{CliError, KeystoreError},
+    keystore::Keystore,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -79,16 +86,16 @@ pub enum StakingCommands {
     },
 }
 
-pub fn input_keystore_password() -> Result<SecretString, String> {
+pub fn input_keystore_password() -> Result<SecretString, CliError> {
     Ok(SecretString::new(
-        rpassword::prompt_password("Keystore password: ").map_err(|e| format!("{:?}", e))?,
+        rpassword::prompt_password("Keystore password: ").map_err(|_| CliError::Unknown)?,
     ))
 }
 
-pub fn get_key_interactive(
+pub fn get_signer_interactive(
     keystore: &Keystore,
     maybe_name: Option<String>,
-) -> Result<String, CliError> {
+) -> Result<PairSigner<PolkadotConfig, Pair>, CliError> {
     let name = if let Some(n) = maybe_name {
         n
     } else {
@@ -99,5 +106,10 @@ pub fn get_key_interactive(
         selection.map_err(|_| CliError::Unknown)?
     };
 
-    keystore.get(name).ok_or(CliError::KeyNotFound)
+    let key = keystore.get(name).ok_or(KeystoreError::KeyNotFound)?;
+
+    let keypair =
+        Pair::from_string(key.as_str(), None).map_err(|_| KeystoreError::InvalidKeyRetrieved)?;
+
+    Ok(PairSigner::new(keypair))
 }
